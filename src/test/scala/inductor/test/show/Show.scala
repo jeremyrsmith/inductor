@@ -42,8 +42,7 @@ object Show extends InductiveCompanion1[Show] with ProductGenericCompanion1[Show
     def show(t: FieldType[K, H] :: T): String = s"${label.value.name}=${showH.show(t.head)}, ${showT.show(t.tail)}"
   }
 
-
-  implicit def generic[P <: Product, L <: HList](implicit
+  @inductive implicit def generic[P <: Product, L <: HList](implicit
     gen: LabelledGeneric.Aux[P, L],
     showL: Show[L]
   ): ProductGeneric[Show[P]] = LabelledProductGeneric {

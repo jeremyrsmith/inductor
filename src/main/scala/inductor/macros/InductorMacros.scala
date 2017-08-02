@@ -11,7 +11,7 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
   import c.universe._
 
   private val Inductive = weakTypeOf[Inductive[_]].typeConstructor
-  private val implTree = weakTypeOf[implTree]
+  private val implTreeAnnot = weakTypeOf[implTree]
   private val WitnessAux = weakTypeOf[shapeless.Witness.Aux[_]].typeConstructor
   private val ScalaSymbol = weakTypeOf[scala.Symbol]
   private val HCons = weakTypeOf[shapeless.::[_, _]].typeConstructor
@@ -23,7 +23,7 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
       case d @ DefDef(mods, name, tParams, paramLists, tpt, rhs) =>
         val annotValue = q"{$d}"//Function(paramLists.head, rhs)
         DefDef(
-          mods.mapAnnotations(q"new $implTree($annotValue)" :: _),
+          mods.mapAnnotations(q"new $implTreeAnnot($annotValue)" :: _),
           name, tParams, paramLists, tpt, rhs
         )
       case other => other
@@ -42,18 +42,141 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
     val T = weakTypeOf[T]
     val A = weakTypeOf[A]
     if(isProduct(A)) {
-      val fields = fieldsOf(A)
-      val fieldTypes = fields.map((mkFieldTpe _).tupled)
-      val inductive = mkHListTpe(fieldTypes)
-      val hlistImplicitType = appliedType(T.typeConstructor, productGeneric.tpe.typeArgs.head.typeArgs.map {
-        case A => inductive
-        case other => other
-      })
+      productGeneric match {
+        case Apply(TypeApply(fun@HasImplTree(DefDef(_, _, implTypeArgs, List(implImplicitParams), _, Apply(TypeApply(Select(Select(_, TermName(pgCall)), TermName("apply")), _), List(implTree)))), typeArgTrees), args) =>
+          val isLabelled = pgCall == "LabelledProductGeneric"
+          val typeArgs = typeArgTrees.map(_.tpe.dealias)
 
-      val hlistImplicit = c.inferImplicitValue(hlistImplicitType)
-      val inlined = inlineInductive(hlistImplicit)
-      println(hlistImplicit)
-      c.abort(c.enclosingPosition, "not ready yet")
+          val fields = fieldsOf(A)
+          val fieldTypes = if (isLabelled)
+            fields.map((mkFieldTpe _).tupled)
+          else
+            fields.map(_._2)
+
+          val inductive = mkHListTpe(fieldTypes)
+          val hlistImplicitType = appliedType(
+            T.typeConstructor, productGeneric.tpe.typeArgs.head.typeArgs.map {
+              case A => inductive
+              case other => other
+            })
+
+          // find the argument that's the appropriate shapeless.[Labelled]Generic type
+          val genericType = if (isLabelled)
+            appliedType(weakTypeOf[shapeless.LabelledGeneric.Aux[_, _]].typeConstructor, A, inductive)
+          else
+            appliedType(weakTypeOf[shapeless.Generic.Aux[_, _]].typeConstructor, A, inductive)
+
+
+          val genericArg = (implImplicitParams zip args).find {
+            case (vParam, arg) => arg.tpe =:= genericType
+          }.getOrElse {
+            c.abort(c.enclosingPosition, s"Derivation ${fun.symbol} does not have an implicit argument of type $genericType")
+          }
+
+          val genericName = genericArg._1.name
+
+          val hlistImplicitArg = (implImplicitParams zip args).find {
+            case (vParam, arg) => arg.tpe =:= hlistImplicitType
+          }.getOrElse {
+            c.abort(c.enclosingPosition, s"Derivation ${fun.symbol} does not have an implicit argument of type $hlistImplicitType")
+          }
+
+          val inlined = inlineInductive(hlistImplicitArg._2)
+
+          val argIsInductive = args.map {
+            arg => arg.tpe =:= genericType || arg.tpe =:= hlistImplicitType
+          }
+
+          val treeCopier = new Transformer {
+            override val treeCopy: TreeCopier = c.universe.newStrictTreeCopier
+          }
+
+          val implCopy = c.typecheck(treeCopier.transform(c.untypecheck(implTree)))
+
+          val eliminatedImplTree = c.internal.substituteTypes(
+            eliminateStableArgs(implCopy, implImplicitParams, argIsInductive, args),
+            implTypeArgs.map(_.symbol),
+            typeArgs)
+
+          val inductiveName = hlistImplicitArg._1.name
+
+          val inlinedMembers = implementationMembers(inlined.tpe, inlined)._1.map {
+            dd => dd.name -> dd
+          }.toMap
+
+          /*
+            Eliminate gen.from and gen.to
+
+            Whenever we see gen.to, we're going to the HList type. We should be passing that HList to an inductive
+            call. So we just inline that inductive call, and replace head | tail.head etc with field accessors.
+
+            Similarly, whenever we see gen.from, we're going from the HList type to the product type. This means what
+            we're passing to gen.from must be the result of an inductive call. This could also be inlined, but it's more
+            difficult because this usually means the HList result has been lifted into some kind of functor and we're
+            mapping over it with gen.from. I haven't dealt with this yet (TODO)
+          */
+          val eliminateGenTo = new Transformer {
+            override def transform(tree: Tree): Tree = {
+              tree match {
+                case MethodCall(Ident(`inductiveName`), methodName, tParams, argLists) if (inlinedMembers contains methodName) && argLists.flatten.exists {
+                  case Apply(Select(Ident(`genericName`), TermName("to")), _) => true
+                  case _ => false
+                } =>
+                  val member = inlinedMembers(methodName)
+                  val flatArgs = member.vparamss.zip(argLists).flatMap {
+                    case (methodParams, methodArgs) => methodParams zip methodArgs
+                  }
+
+                  val argTrees = flatArgs.map {
+                    case (methodParam, methodArg) => methodParam.name -> methodArg
+                  }.toMap
+
+                  val (prodArg, prodTree) = flatArgs.collectFirst {
+                    case (methodParam, Apply(Select(Ident(`genericName`), TermName("to")), List(prod))) => methodParam.name -> prod
+                  }.get
+
+                  val transformer = new Transformer {
+
+                    object HeadsyTailsy {
+                      def unapply(tree: Tree): Option[Int] = tree match {
+                        case Select(HeadsyTailsy(i), TermName("head")) => Some(i)
+                        case Select(HeadsyTailsy(i), TermName("tail")) => Some(i + 1)
+                        case Ident(`prodArg`) => Some(0)
+                        case _ => None
+                      }
+                    }
+
+                    override def transform(tree: Tree): Tree = {
+                      val result = tree match {
+                        case HeadsyTailsy(i) if i == fields.length => c.typecheck(reify(shapeless.HNil).tree)
+                        case HeadsyTailsy(i) =>
+                          c.typecheck(Typed(Select(prodTree, fields(i)._1), TypeTree(fields(i)._2)))
+                        case Ident(name: TermName) if argTrees contains name =>
+                          argTrees(name)
+                        case other => super.transform(other)
+                      }
+                      result
+                    }
+                  }
+                  val result = transformer.transform(member.rhs)
+                  result
+
+                case dd: DefDef => c.typecheck(super.transform(dd))
+                case other => super.transform(other)
+              }
+            }
+          }
+
+          val result = eliminateGenTo.transform(eliminatedImplTree)
+
+          val typed = try c.typecheck(result) catch {
+            case err: Throwable =>
+              val e = err
+              println(e)
+              throw e
+          }
+          typed
+      }
     } else {
       c.abort(c.enclosingPosition, "Not a product type")
     }
@@ -71,26 +194,19 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
     instances, like
 
       new Foo[Bar :: Baz :: Int :: HNil] {
-        def method(param: Bar :: Baz :: Int :: HNil): Result = param match {
-          case _1 :: _2 :: _3 :: HNil => Something.bar(_1) combine Something.baz(_2) combine Something.int(_3) combine HNilResult
-        }
+        def method(param: Bar :: Baz :: Int :: HNil): Result =
+          Something.bar(param.head) combine Something.baz(param.tail.head) combine Something.int(param.tail.tail.head) combine Something.hnil(param.tail.tail.tail)
       }
 
     The strategy for this is to go through all of the parameters to the given tree, and recurse into any inductive calls within those parameters until
     reaching leaves. Then as we walk back up the recursion tree, we create a new implementation at each step that inlines the implementations of the
     arguments it has, and return a new tree with that implementation. So after the first step we would have:
 
-      Foo.hcons(
-        something = Something.bar,
-        prev = Foo.hcons(
-          something = Something.baz,
-          prev = new Foo[Int :: HNil] {
-            def method(param: Int :: HNil): Result = {
-              case _1 :: HNil => Something.int(_1) combine HNilResult
-            }
-          }
-        )
-      )
+      new Foo[Baz :: Int :: HNil] {
+        def method(param: Baz :: Int :: HNil): Result =
+          Something.baz(param.head) combine Something.int(param.tail.head) combine Something.hnil(param.tail.tail)
+      }
+
 
     Where the `Something.int(_1) combine _` comes from inlining the argument (Something.int) into the implementation of Foo.hcons (i.e. param.head)
     and the HNilResult comes directly from the implementation of Foo.hnil.
@@ -98,221 +214,168 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
     From there, it's not hard to imagine repeating that for the second step - inlining that implementation further with in the same way given the
     parameter of Something.baz - and so forth.
   */
-  private def inlineInductive(current: Tree): Tree = {
-    val T = current.tpe
-    current match {
-      case Apply(fun @ HasImplTree(impl), args) =>
-
-        // replace type arguments in the impl
-
-        // find all the methods and dependent types we have to implement for this type
-        val (methods: List[DefDef], types: List[TypeDef]) = impl.rhs match {
-          case Block(List(ClassDef(_, _, _, Template(_, _, implDecls))), _) => (
-            implDecls.collect {
-              case dd @ DefDef(mods, name, tParams, vParams, tpt, rhs)
-                if !dd.symbol.isConstructor && T.decl(dd.name).isMethod =>
-                  val sym = T.decl(dd.name).asMethod
-                  val symTyp = sym.typeSignatureIn(T)
-                  val typed = c.internal.defDef(
-                    sym,
-                    vParams.zip(symTyp.paramLists).map {
-                      case (implParams, symParams) => implParams zip symParams map {
-                        case (implParam, symParam) =>
-                          c.internal.valDef(symParam)
-                      }
-                    },
-                    c.untypecheck(rhs)
-                  )
-                c.typecheck(typed)
-            },
-            implDecls.collect {
-              case td: TypeDef if T.member(td.name).isType => td
-            }
-          )
-        }
-
-        val inlinedArgs = args.map {
-          case inductiveParam @ Apply(HasImplTree(_), _) =>
-            true -> inlineInductive(inductiveParam)
-          case a @ Apply(inductiveCall, inductiveArgs) if a.tpe.typeConstructor <:< T.typeConstructor =>
-            c.warning(current.pos, s"Inductive implementation ${fun.symbol.fullName} is not annotated with @inductive; the inductive derivation won't be optimized")
-            c.abort(current.pos, "Not inductive")
-          case other => false -> other
-        }
-
-        val inlinedMethods = methods.map {
-          case DefDef(mods, name, tParams, paramLists, tpt, body) =>
-            // match each of the implicit params of the implementation with the argument tree
-            val suppliedArgs = impl.vparamss.head.zip(inlinedArgs)
-
-            // inlined implementations
-            val inlinedBody = suppliedArgs.filter(_._2._1).foldLeft(body) {
-              case (currentBody, (param, (_, paramImpl))) =>
-                val paramName = param.name
-                paramImpl match {
-                  // The inlined value is given as { class $anon extends TC[..] { ... }; new $anon }
-                  case Block(List(ClassDef(_, _, _, Template(_, _, paramImplDefs))), _) =>
-                    // we want to inline all of the method calls made on this param
-                    val paramImplMethods = paramImplDefs.collect {
-                      case dd: DefDef => dd
-                    }
-                    val xf = new Transformer {
-                      override def transform(tree: Tree): Tree = tree match {
-                        case Apply(s @ Select(Ident(`paramName`), method), methodArgs) if s.symbol.isMethod =>
-                          val pid = paramImplDefs
-                          val methodImpl = paramImplMethods.find {
-                            dd => dd.name == method // TODO: this won't handle overloaded methods correctly
-//                              val ss = s
-//                              val sTpe = s.tpe
-//                              val ddParamTypes = dd.vparamss.map(_.map(_.tpe))
-//                              val sParamTypes = s.symbol.typeSignatureIn(s.tpe).paramLists.map(_.map(_.typeSignature))
-//                              dd.name == s.symbol.name && ddParamTypes == sParamTypes
-                          }
-                          methodImpl.collect {
-                            case mi if mi.vparamss.length == 1 => // TODO: handle curried methods
-                              val applyMatchArgs = mi.vparamss.head.zip(methodArgs)
-                              applyArgsMatch(applyMatchArgs, mi.rhs)
-                          }.getOrElse(super.transform(tree))
-                        case _ => super.transform(tree)
-                      }
-                    }
-                    val result = xf.transform(currentBody)
-                    result
-                }
-                //println(paramImpl)
-                //currentBody
-            }
-
-            val matchTupleArgs = suppliedArgs.filterNot(_._2._1).map(t => t._1 -> t._2._2)
-
-            // create a reference to each of the args, replacing the implicit argument of the derivation within the body
-            val inlinedMatch = applyArgsMatch(matchTupleArgs, inlinedBody)
-
-            val outerMatch = collapseNestedMatches(
-              applyArgsMatch(paramLists.flatten.map(vd => vd -> q"${vd.name}: ${vd.tpt}"), inlinedMatch)
-            )
-
-            DefDef(mods, name, tParams, paramLists, tpt, outerMatch)
-        }
-
-        val inlinedTypes = types.map {
-          case TypeDef(mods, name, tParams, rhs) =>
-            // substitute any references to the type parameters of the derivation
-            // TODO
-        }
-
-        val anon = TypeName(c.freshName(T.typeSymbol.name.toString))
-
-        val result =
-          q"""
-             final class $anon extends $T {
-               ..$inlinedMethods
-             }
-             new $anon
-           """
-
-        println(result)
-
-        //c.abort(c.enclosingPosition, "not yet")
-        try {
-          c.typecheck(result)
-          //result
-        } catch {
-          case err: Throwable =>
-            val e = err
-            println(err)
-            throw err
-        }
-      case Apply(fun, _) =>
-        c.warning(current.pos, s"Inductive implementation ${fun.symbol.fullName} is not annotated with @inductive; the inductive derivation won't be optimized")
-        c.abort(current.pos, "Not inductive")
-
+  private def inlineInductive(derived: Tree): Tree = {
+    val T = derived.tpe
+    derived match {
+      case Apply(TypeApply(fun @ HasImplTree(impl @ DefDef(_, _, implTypeArgs, List(implImplicitParams), implTypeTree, implTree)), typeArgs), args) =>
+        inlineInductiveDerivation(T, fun, impl, implTypeArgs, implImplicitParams, implTypeTree, implTree, typeArgs.map(_.tpe.dealias), args)
+      case Apply(fun @ HasImplTree(impl @ DefDef(_, _, Nil, List(implImplicitParams), implTypeTree, implTree)), args) =>
+        inlineInductiveDerivation(T, fun, impl, Nil, implImplicitParams, implTypeTree, implTree, Nil, args)
     }
   }
 
-  private def applyArgsMatch(args: List[(ValDef, Tree)], body: Tree): Tree = {
+  private def inlineInductiveDerivation(T: Type, fun: Tree, impl: DefDef, implTypeArgs: List[TypeDef], implImplicitParams: List[ValDef], implTypeTree: Tree, implTree: Tree, typeArgs: List[Type], args: List[Tree]): Tree = {
 
-    val eliminatedArgs = args.collect {
-      // eliminate witnesses
-      case (v @ ValDef(mods, name, tpt, rhs), tree) if tree.tpe != null && tree.tpe.typeConstructor <:< WitnessAux =>
-        tree.tpe.typeArgs.headOption.collect {
-          case SingletonSymbolType(str) => name -> q"$str"
-          case ConstantType(const) => name -> q"$const"
-        }
-      // eliminate stable typeclass instance refs and other static references
-      case (v @ ValDef(mods, name, tpt, rhs), s @ Select(qual, sel))
-        if qual.symbol.isModule && qual.symbol.isPublic && s.symbol.isTerm && s.symbol.isPublic && s.symbol.asTerm.isStable =>
-          Some(name -> s)
-    }.flatten.toMap
+    // which arguments are further inductive?
+    val argIsInductive = args.map {
+      case Apply(HasImplTree(_), _) => true
+      case a @ Apply(_, _) if a.tpe.typeConstructor <:< T.typeConstructor =>
+        c.warning(fun.pos, s"Inductive implementation ${fun.symbol.fullName} is not annotated with @inductive; the inductive derivation won't be optimized")
+        c.abort(c.enclosingPosition, "Not inductive")
+      case _ => false
+    }
 
-    // simplify match construct for HCons args using head and tail
-    val hconsArgs = args.collect {
-      case (v @ ValDef(mods, name, tpt, rhs), tree) if tpt.tpe != null && tpt.tpe.typeConstructor <:< HCons =>
-        name -> (TermName(c.freshName(name.toString + "_head")), TermName(c.freshName(name.toString + "_tail")))
+    val treeCopier = new Transformer {
+      override val treeCopy: TreeCopier = c.universe.newStrictTreeCopier
+    }
+
+    val implCopy = c.typecheck(c.untypecheck(treeCopier.transform(implTree)))
+
+    // all remaining arguments should be stable, public implicits
+    // eliminate references to those arguments in the implementation and substitute type arguments
+    val eliminatedImplTree = c.internal.substituteTypes(
+      eliminateStableArgs(implCopy, implImplicitParams, argIsInductive, args),
+      implTypeArgs.map(_.symbol),
+      typeArgs)
+
+    val inductiveMembers = (implImplicitParams zip argIsInductive zip args).collect {
+      case ((param, true), arg) =>
+        param.name -> implementationMembers(arg.tpe, inlineInductive(arg))._1
     }.toMap
 
-    val nonEliminatedArgs = args.filterNot { case (vd, _) => eliminatedArgs contains vd.name }
+    val result =
+      eliminateInductiveCalls(eliminatedImplTree, inductiveMembers)
 
-    val simplifiedBody = new Transformer {
+    try {
+      c.typecheck(result)
+    } catch {
+      case err: Throwable =>
+        val e = err
+        println(e)
+        throw e
+    }
+  }
+
+
+  private def eliminateInductiveCalls(implTree: Tree, inductiveMembers: Map[TermName, List[DefDef]]): Tree = {
+    val transform = new Transformer {
+      override def transform(tree: Tree): Tree = tree match {
+        case MethodCall(Ident(targetName: TermName), methodName, tParams, paramLists) if inductiveMembers contains targetName =>
+          // TODO: this won't respect overloaded methods - be more rigorous in finding the precise method to inline
+          val targetMethod = inductiveMembers(targetName).find(_.name.toString == methodName.toString).getOrElse {
+            c.abort(tree.pos, s"Couldn't inline method $methodName")
+          }
+
+          val methodArgs = targetMethod.vparamss.zip(paramLists).map {
+            case (methodParams, callParams) => methodParams.zip(callParams)
+          }.flatMap {
+            tups => tups.map {
+              case (vd, impl) =>
+                vd.name -> impl
+            }
+          }.toMap
+
+          // TODO: is it safe to assume that the arguments are referentially transparent?
+          // Right now there is no memoization happening, so the argument trees must not side effect.
+
+          val inliner = new Transformer {
+            override def transform(tree: Tree): Tree = tree match {
+              case Ident(name: TermName) if methodArgs contains name => methodArgs(name)
+              case other => super.transform(other)
+            }
+          }
+
+          inliner.transform(targetMethod.rhs)
+
+        case other => super.transform(other)
+      }
+    }
+    transform.transform(implTree)
+  }
+
+  private def eliminateStableArgs(implTree: Tree, implImplicitParams: List[ValDef], argIsInductive: List[Boolean], args: List[Tree]): Tree = {
+    val eliminatedArgs = implImplicitParams.zip(argIsInductive.zip(args)).collect {
+      // eliminate witnesses
+      case (v @ ValDef(mods, name, tpt, rhs), (false, tree)) if tree.tpe != null && tree.tpe.typeConstructor <:< WitnessAux && tree.tpe.typeArgs.length == 1 =>
+        tree.tpe.typeArgs.head match {
+          case SingletonSymbolType(str) => name -> c.typecheck(q"$str")
+          case ConstantType(const) => name -> c.typecheck(q"$const")
+        }
+
+      // eliminate stable typeclass instance refs and other static references
+      case (v @ ValDef(mods, name, tpt, rhs), (false, s @ Select(qual, sel)))
+        if qual.symbol.isModule && qual.symbol.isPublic && s.symbol.isTerm && s.symbol.isPublic && s.symbol.asTerm.isStable =>
+        name -> s
+
+      case (param, (false, arg)) =>
+        c.warning(arg.pos, s"Supplied non-inductive implicit $arg is not stable; cannot proceed with optimization")
+        c.abort(c.enclosingPosition, "Cannot optimize due to non-stable, non-inductive implicit")
+    }.toMap
+
+    val transform = new Transformer {
       override def transform(tree: Tree): Tree = tree match {
         case Select(v @ Select(i @ Ident(name: TermName), TermName("value")), TermName("name"))
           if i.tpe != null && i.tpe.typeConstructor <:< WitnessAux && (eliminatedArgs contains name) && (v.tpe <:< ScalaSymbol) => eliminatedArgs(name)
         case Select(i @ Ident(name: TermName), TermName("value"))
           if i.tpe != null && i.tpe.typeConstructor <:< WitnessAux && (eliminatedArgs contains name) => eliminatedArgs(name)
-        case Select(Ident(name: TermName), TermName("head")) if hconsArgs contains name =>
-          Ident(hconsArgs(name)._1)
-        case Select(Ident(name: TermName), TermName("tail")) if hconsArgs contains name =>
-          Ident(hconsArgs(name)._2)
         case Ident(name: TermName) if eliminatedArgs contains name => eliminatedArgs(name)
         case other => super.transform(other)
       }
-    }.transform(body)
-
-    if(nonEliminatedArgs.nonEmpty) {
-      val matchPat = pq"""(..${
-        nonEliminatedArgs.map {
-          case (vd, _) if hconsArgs contains vd.name => pq"$HConsObj(${hconsArgs(vd.name)._1}, ${hconsArgs(vd.name)._2})"
-          case (vd, _) => pq"${vd.name}"
-        }
-      })"""
-      val matchCase = cq"$matchPat => $simplifiedBody"
-      q"(..${nonEliminatedArgs.map(_._2)}) match { case $matchCase }"
-    } else {
-      simplifiedBody
     }
+
+    transform.transform(implTree)
   }
 
-  private def collapseNestedMatches(tree: Tree): Tree = tree match {
-    case Match(q"(..$sels)", List(CaseDef(pq"(..$pats)", EmptyTree, body))) =>
-      val simplified = (sels zip pats).foldLeft(body) {
-        case (current, (sel @ Typed(Ident(argName), argTpt), q"$HConsObj(${Bind(headName, _)}, ${Bind(tailName, _)})")) =>
-          val ccurrent = current
-          val ssel = sel
-          val hpat = headName
-          val tpat = tailName
-          new Transformer {
-            override def transform(tree: Tree): Tree = tree match {
-              case Ident(`headName`) => Select(Ident(argName), TermName("head"))
-              case Ident(`tailName`) => Select(Ident(argName), TermName("tail"))
-              case other => super.transform(other)
+  private def implementationMembers(T: Type, implTree: Tree): (List[DefDef], List[TypeDef]) = implTree match {
+    case Block(List(ClassDef(_, _, _, Template(_, _, implDecls))), _) => (
+      implDecls.collect {
+        case dd @ DefDef(mods, name, tParams, vParams, tpt, rhs)
+          if !dd.symbol.isConstructor && T.decl(dd.name).isMethod =>
+          val sym = T.decl(dd.name).asMethod
+          val symTyp = sym.typeSignatureIn(T)
+          val typed = DefDef(mods, name, tParams,
+            vParams.zip(symTyp.paramLists).map {
+              case (implParams, symParams) => implParams zip symParams map {
+                case (implParam, symParam) =>
+                  c.internal.valDef(symParam)
+              }
+            },
+            TypeTree(symTyp.finalResultType),
+            rhs
+          )
+          try {
+            c.typecheck(typed) match {
+              case dd: DefDef => dd
+              case other => c.abort(c.enclosingPosition, s"Unexpected tree type ${other.getClass.getSimpleName} after untypechecking DefDef")
             }
-          }.transform(current)
-        case (current, _) => current
+          } catch {
+            case err: Throwable =>
+              val e = err
+              println(e)
+              throw e
+          }
+      },
+      implDecls.collect {
+        case td: TypeDef if T.member(td.name).isType => td
       }
-
-//      val simplifiedBody = new Transformer {
-//        override def transform(tree: Tree): Tree = tree match {
-//          case Ident(`headName`) =>
-//        }
-//      }
-
-      println(body)
-      tree
-    case other => other
+    )
   }
 
-  private def inlineInductiveArgs(impl: DefDef, args: List[Tree]): Tree = {
-    EmptyTree
+  private def inductivePattern(arg: Tree): (Tree => Match, List[TermName]) = {
+    val argTyp = arg.tpe
+    argTyp match {
+      case BinaryInductiveType(matchFnFn) => matchFnFn(arg)
+    }
   }
 
   def mkLabelledProductGeneric[P : WeakTypeTag, L : WeakTypeTag, ProductTC : WeakTypeTag, HListTC : WeakTypeTag](
@@ -325,10 +388,45 @@ class InductorMacros(val c: whitebox.Context) extends CaseClassMacros with Singl
     def unapply(tree: Tree): Option[DefDef] = {
       val sym = tree.symbol
       val annots = sym.annotations
-      annots.find(_.tree.tpe <:< implTree).map(_.tree).map {
+      annots.find(_.tree.tpe <:< implTreeAnnot).map(_.tree).map {
         case Apply(_, List(Block(List(defdef: DefDef), _))) => defdef
         case other => c.abort(other.pos, "Malformed @implTree annotation")
       }
+    }
+  }
+
+  object BinaryInductiveType {
+    def unapply(typ: Type): Option[Tree => ((Tree => Match), List[TermName])] = typ.typeArgs match {
+      case List(first, second) if typ.companion.typeSymbol.isModule =>
+        val companionType = typ.companion
+        val companion = companionType.termSymbol
+
+        unapply(second).map {
+          fn => fn andThen {
+            case (prevMatchFn, names) =>
+              val name = TermName(c.freshName())
+              val matchFn = prevMatchFn andThen {
+                case Match(sel, List(cq"$pat => $body")) =>
+                  Match(sel, List(cq"$companion($name, $pat) => $body"))
+              }
+              matchFn -> (name :: names)
+          }
+        }
+
+      case Nil => Some {
+        selector =>
+          val name = TermName(c.freshName())
+          ((body: Tree) => Match(q"$selector", List(cq"$name @ _ => $body"))) -> List(name)
+      }
+    }
+  }
+
+  object MethodCall {
+    def unapply(tree: Tree): Option[(Tree, TermName, List[Type], List[List[Tree]])] = tree match {
+      case Apply(MethodCall(target, name, tParams, paramLists), paramList) => Some((target, name, tParams, paramLists :+ paramList))
+      case Apply(Select(target, name: TermName), params) => Some((target, name, Nil, List(params)))
+      case TypeApply(Select(target, name: TermName), typeParams) => Some((target, name, typeParams.map(_.tpe), Nil))
+      case _ => None
     }
   }
 
